@@ -60,10 +60,17 @@ java_library(
     ]),
     deps = [
         ":common",
+        "//src/main/protobuf:build_buildfarm_v1test_buildfarm_java_proto",
         "@googleapis//:google_bytestream_bytestream_java_grpc",
         "@googleapis//:google_bytestream_bytestream_java_proto",
+        "@maven//:com_google_api_client_google_api_client",
+        "@maven//:com_google_apis_google_api_services_cloudresourcemanager",
+        "@maven//:com_google_apis_google_api_services_iam",
+        "@maven//:com_google_auth_google_auth_library_credentials",
+        "@maven//:com_google_auth_google_auth_library_oauth2_http",
         "@maven//:com_google_code_findbugs_jsr305",
         "@maven//:com_google_guava_guava",
+        "@maven//:com_google_http_client_google_http_client_jackson2",
         "@maven//:com_google_protobuf_protobuf_java",
         "@maven//:io_grpc_grpc_api",
         "@maven//:io_grpc_grpc_context",
@@ -450,6 +457,10 @@ java_binary(
 container_image(
     name = "buildfarm-shard-worker.container",
     base = "@java_base//image",
+    cmd = [
+        "buildfarm-shard-worker_deploy.jar",
+        "/config/shard-worker.config",
+    ],
     # leverage the implicit target of the buildfarm-shard-worker to get a fat jar.
     # this is simply a workaround for the fact that we have so many dependencies,
     # so we'd want some wrappy script. This seemed more straightforward.

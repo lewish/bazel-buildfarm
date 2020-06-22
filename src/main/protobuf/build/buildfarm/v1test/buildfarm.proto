@@ -60,6 +60,17 @@ message PollOperationRequest {
   build.bazel.remote.execution.v2.ExecutionStage.Value stage = 3;
 }
 
+message GoogleAuthConfig {
+  string project_id = 1;
+  repeated string required_permissions = 2;
+}
+
+message AuthConfig {
+  oneof config {
+    GoogleAuthConfig google = 1;
+  }
+}
+
 message BuildFarmServerConfig {
   repeated InstanceConfig instances = 1;
 
@@ -70,6 +81,8 @@ message BuildFarmServerConfig {
   int32 execute_keepalive_after_seconds = 4;
 
   MetricsConfig metrics_config = 5;
+
+  AuthConfig auth_config = 6;
 }
 
 message MetricsConfig {

@@ -20,6 +20,7 @@ import static java.util.concurrent.Executors.newSingleThreadScheduledExecutor;
 import static java.util.logging.Level.SEVERE;
 
 import build.buildfarm.common.LoggingMain;
+import build.buildfarm.common.grpc.GoogleAuthInterceptor;
 import build.buildfarm.common.grpc.TracingMetadataUtils.ServerHeadersInterceptor;
 import build.buildfarm.common.metrics.MetricsPublisher;
 import build.buildfarm.common.metrics.aws.AwsMetricsPublisher;
@@ -109,6 +110,7 @@ public class BuildFarmServer extends LoggingMain {
             .addService(new OperationsService(instances))
             .intercept(TransmitStatusRuntimeExceptionInterceptor.instance())
             .intercept(headersInterceptor)
+            .intercept(new GoogleAuthInterceptor(config.getAuthConfig().getGoogle()))
             .build();
 
     logger.log(Level.INFO, String.format("%s initialized", session));

@@ -15,7 +15,7 @@ def buildfarm_images():
 
     container_pull(
         name = "java_base",
-        digest = "sha256:8c1769cb253bdecc257470f7fba05446a55b70805fa686f227a11655a90dfe9e",
+        tag = "11",
         registry = "gcr.io",
         repository = "distroless/java",
     )
