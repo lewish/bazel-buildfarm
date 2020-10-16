@@ -38,8 +38,10 @@ import build.buildfarm.v1test.CompletedOperationMetadata;
 import build.buildfarm.v1test.DispatchedOperation;
 import build.buildfarm.v1test.ExecuteEntry;
 import build.buildfarm.v1test.ExecutingOperationMetadata;
+import build.buildfarm.v1test.GetClientStartTimeResult;
 import build.buildfarm.v1test.OperationChange;
 import build.buildfarm.v1test.OperationsStatus;
+import build.buildfarm.v1test.ProvisionedQueue;
 import build.buildfarm.v1test.QueueEntry;
 import build.buildfarm.v1test.QueuedOperationMetadata;
 import build.buildfarm.v1test.RedisShardBackplaneConfig;
@@ -54,12 +56,14 @@ import com.google.common.collect.ListMultimap;
 import com.google.common.collect.Maps;
 import com.google.common.collect.MultimapBuilder;
 import com.google.common.collect.Multimaps;
+import com.google.common.collect.SetMultimap;
 import com.google.common.collect.Sets;
 import com.google.common.util.concurrent.ListenableFuture;
 import com.google.longrunning.Operation;
 import com.google.protobuf.InvalidProtocolBufferException;
 import com.google.protobuf.Timestamp;
 import com.google.protobuf.util.JsonFormat;
+import com.google.protobuf.util.Timestamps;
 import com.google.rpc.Code;
 import com.google.rpc.PreconditionFailure;
 import com.google.rpc.Status;
@@ -68,6 +72,7 @@ import java.time.Instant;
 import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Date;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -486,26 +491,60 @@ public class RedisShardBackplane implements ShardBackplane {
     failsafeOperationThread.start();
   }
 
+  private SetMultimap<String, String> toMultimap(List<Platform.Property> provisions) {
+    SetMultimap<String, String> set = LinkedHashMultimap.create();
+    for (Platform.Property property : provisions) {
+      set.put(property.getName(), property.getValue());
+    }
+    return set;
+  }
+
   @Override
-  public void start() throws IOException {
+  public void start(String clientPublicName) throws IOException {
 
+    // Construct a single redis client to be used throughout the entire backplane.
+    // We wish to avoid various synchronous and error handling issues that could occur when using
+    // multiple clients.
     client = new RedisClient(jedisClusterFactory.get());
-    List<String> hashtags = client.call(jedis -> RedisNodeHashes.getEvenlyDistributedHashes(jedis));
-    this.prequeue = new BalancedRedisQueue(config.getPreQueuedOperationsListName(), hashtags);
 
-    // The operations queue can be divided into multiple queues handling different platform
-    // executions.
-    // In this case, we have a single with no explicitly required platform executions.
-    ProvisionedRedisQueue defaultQueue =
-        new ProvisionedRedisQueue(
-            config.getQueuedOperationsListName(), hashtags, LinkedHashMultimap.create());
-    List<ProvisionedRedisQueue> provisionedQueues =
-        new ArrayList<ProvisionedRedisQueue>() {
-          {
-            add(defaultQueue);
-          }
-        };
-    this.operationQueue = new OperationQueue(provisionedQueues);
+    // Construct the prequeue so that elements are balanced across all redis nodes.
+    List<String> clusterHashes =
+        client.call(jedis -> RedisNodeHashes.getEvenlyDistributedHashes(jedis));
+    this.prequeue = new BalancedRedisQueue(config.getPreQueuedOperationsListName(), clusterHashes);
+
+    // Construct an operation queue based on configuration.
+    // An operation queue consists of multiple provisioned queues in which the order dictates the
+    // eligibility and placement of operations.
+    // Therefore, it is recommended to have a final provision queue with no actual platform
+    // requirements.  This will ensure that all operations are eligible for the final queue.
+    ImmutableList.Builder<ProvisionedRedisQueue> provisionedQueues = new ImmutableList.Builder<>();
+    for (ProvisionedQueue queueConfig : config.getProvisionedQueues().getQueuesList()) {
+      ProvisionedRedisQueue provisionedQueue =
+          new ProvisionedRedisQueue(
+              queueConfig.getName(),
+              clusterHashes,
+              toMultimap(queueConfig.getPlatform().getPropertiesList()));
+      provisionedQueues.add(provisionedQueue);
+    }
+
+    // If there is no configuration for provisioned queues, we might consider that an error.
+    // After all, the operation queue is made up of n provisioned queues, and if there were no
+    // provisioned queues provided, we can not properly construct the operation queue.
+    // In this case however, we will automatically provide a default queue will full eligibility on
+    // all operations.
+    // This will ensure the expected behavior for the paradigm in which all work is put on the same
+    // queue.
+    if (config.getProvisionedQueues().getQueuesList().isEmpty()) {
+      SetMultimap defaultProvisions = LinkedHashMultimap.create();
+      defaultProvisions.put(
+          ProvisionedRedisQueue.WILDCARD_VALUE, ProvisionedRedisQueue.WILDCARD_VALUE);
+      ProvisionedRedisQueue defaultQueue =
+          new ProvisionedRedisQueue(
+              config.getQueuedOperationsListName(), clusterHashes, defaultProvisions);
+      provisionedQueues.add(defaultQueue);
+    }
+
+    this.operationQueue = new OperationQueue(provisionedQueues.build());
 
     if (config.getSubscribeToBackplane()) {
       startSubscriptionThread();
@@ -513,6 +552,10 @@ public class RedisShardBackplane implements ShardBackplane {
     if (config.getRunFailsafeOperation()) {
       startFailsafeOperationThread();
     }
+
+    // Record client start time
+    client.call(
+        jedis -> jedis.set("startTime/" + clientPublicName, Long.toString(new Date().getTime())));
   }
 
   @Override
@@ -1128,15 +1171,32 @@ public class RedisShardBackplane implements ShardBackplane {
         });
   }
 
+  String printPollOperation(QueueEntry queueEntry, ExecutionStage.Value stage, long requeueAt)
+      throws InvalidProtocolBufferException {
+    DispatchedOperation o =
+        DispatchedOperation.newBuilder().setQueueEntry(queueEntry).setRequeueAt(requeueAt).build();
+    return JsonFormat.printer().print(o);
+  }
+
   @Override
   public void rejectOperation(QueueEntry queueEntry) throws IOException {
     String operationName = queueEntry.getExecuteEntry().getOperationName();
     String queueEntryJson = JsonFormat.printer().print(queueEntry);
+    String dispatchedEntryJson = printPollOperation(queueEntry, ExecutionStage.Value.QUEUED, 0);
     client.run(
         jedis -> {
-          if (jedis.hdel(config.getDispatchedOperationsHashName(), operationName) == 1) {
-            operationQueue.push(
-                jedis, queueEntry.getPlatform().getPropertiesList(), queueEntryJson);
+          if (isBlacklisted(jedis, queueEntry.getExecuteEntry().getRequestMetadata())) {
+            pollOperation(
+                jedis, operationName, dispatchedEntryJson); // complete our lease to error operation
+          } else {
+            Operation operation = parseOperationJson(getOperation(jedis, operationName));
+            boolean requeue =
+                operation != null && !operation.getDone(); // operation removed or completed somehow
+            if (jedis.hdel(config.getDispatchedOperationsHashName(), operationName) == 1
+                && requeue) {
+              operationQueue.push(
+                  jedis, queueEntry.getPlatform().getPropertiesList(), queueEntryJson);
+            }
           }
         });
   }
@@ -1145,26 +1205,27 @@ public class RedisShardBackplane implements ShardBackplane {
   public boolean pollOperation(QueueEntry queueEntry, ExecutionStage.Value stage, long requeueAt)
       throws IOException {
     String operationName = queueEntry.getExecuteEntry().getOperationName();
-    DispatchedOperation o =
-        DispatchedOperation.newBuilder().setQueueEntry(queueEntry).setRequeueAt(requeueAt).build();
     String json;
     try {
-      json = JsonFormat.printer().print(o);
+      json = printPollOperation(queueEntry, stage, requeueAt);
     } catch (InvalidProtocolBufferException e) {
       logger.log(Level.SEVERE, "error printing dispatched operation " + operationName, e);
       return false;
     }
-    return client.call(
-        jedis -> {
-          if (jedis.hexists(config.getDispatchedOperationsHashName(), operationName)) {
-            if (jedis.hset(config.getDispatchedOperationsHashName(), operationName, json) == 0) {
-              return true;
-            }
-            /* someone else beat us to the punch, delete our incorrectly added key */
-            jedis.hdel(config.getDispatchedOperationsHashName(), operationName);
-          }
-          return false;
-        });
+    return client.call(jedis -> pollOperation(jedis, operationName, json));
+  }
+
+  boolean pollOperation(JedisCluster jedis, String operationName, String dispatchedOperationJson) {
+    if (jedis.hexists(config.getDispatchedOperationsHashName(), operationName)) {
+      if (jedis.hset(
+              config.getDispatchedOperationsHashName(), operationName, dispatchedOperationJson)
+          == 0) {
+        return true;
+      }
+      /* someone else beat us to the punch, delete our incorrectly added key */
+      jedis.hdel(config.getDispatchedOperationsHashName(), operationName);
+    }
+    return false;
   }
 
   @Override
@@ -1273,6 +1334,11 @@ public class RedisShardBackplane implements ShardBackplane {
   }
 
   @Override
+  public Boolean propertiesEligibleForQueue(List<Platform.Property> provisions) {
+    return operationQueue.isEligible(provisions);
+  }
+
+  @Override
   public boolean isBlacklisted(RequestMetadata requestMetadata) throws IOException {
     if (requestMetadata.getToolInvocationId().isEmpty()
         && requestMetadata.getActionId().isEmpty()) {
@@ -1310,5 +1376,18 @@ public class RedisShardBackplane implements ShardBackplane {
                 .setDispatchedSize(jedis.hlen(config.getDispatchedOperationsHashName()))
                 .addAllActiveWorkers(workerSet)
                 .build());
+  }
+
+  @Override
+  public GetClientStartTimeResult getClientStartTime(String clientKey) throws IOException {
+    try {
+      return client.call(
+          jedis ->
+              GetClientStartTimeResult.newBuilder()
+                  .setClientStartTime(Timestamps.fromMillis(Long.parseLong(jedis.get(clientKey))))
+                  .build());
+    } catch (NumberFormatException nfe) {
+      return GetClientStartTimeResult.newBuilder().build();
+    }
   }
 }

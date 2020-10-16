@@ -22,10 +22,10 @@ import static java.util.logging.Level.SEVERE;
 import build.buildfarm.common.LoggingMain;
 import build.buildfarm.common.grpc.GoogleAuthInterceptor;
 import build.buildfarm.common.grpc.TracingMetadataUtils.ServerHeadersInterceptor;
-import build.buildfarm.common.metrics.MetricsPublisher;
-import build.buildfarm.common.metrics.aws.AwsMetricsPublisher;
-import build.buildfarm.common.metrics.gcp.GcpMetricsPublisher;
-import build.buildfarm.common.metrics.log.LogMetricsPublisher;
+import build.buildfarm.metrics.MetricsPublisher;
+import build.buildfarm.metrics.aws.AwsMetricsPublisher;
+import build.buildfarm.metrics.gcp.GcpMetricsPublisher;
+import build.buildfarm.metrics.log.LogMetricsPublisher;
 import build.buildfarm.v1test.BuildFarmServerConfig;
 import build.buildfarm.v1test.MetricsConfig;
 import com.google.devtools.common.options.OptionsParser;
@@ -108,6 +108,7 @@ public class BuildFarmServer extends LoggingMain {
                     getMetricsPublisher(config.getMetricsConfig())))
             .addService(new OperationQueueService(instances))
             .addService(new OperationsService(instances))
+            .addService(new AdminService(config.getAdminConfig(), instances))
             .intercept(TransmitStatusRuntimeExceptionInterceptor.instance())
             .intercept(headersInterceptor)
             .intercept(new GoogleAuthInterceptor(config.getAuthConfig().getGoogle()))
@@ -137,9 +138,9 @@ public class BuildFarmServer extends LoggingMain {
     }
   }
 
-  public void start() throws IOException {
+  public void start(String publicName) throws IOException {
     actionCacheRequestCounter.start();
-    instances.start();
+    instances.start(publicName);
     server.start();
     healthStatusManager.setStatus(
         HealthStatusManager.SERVICE_NAME_ALL_SERVICES, ServingStatus.SERVING);
@@ -224,7 +225,7 @@ public class BuildFarmServer extends LoggingMain {
           new BuildFarmServer(
               session, toBuildFarmServerConfig(new InputStreamReader(configInputStream), options));
       configInputStream.close();
-      server.start();
+      server.start(options.publicName);
       server.blockUntilShutdown();
       server.stop();
       return true;

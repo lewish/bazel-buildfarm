@@ -15,6 +15,7 @@
 package build.buildfarm.common.grpc;
 
 import static com.google.common.truth.Truth.assertThat;
+import static java.util.concurrent.TimeUnit.MICROSECONDS;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.mockito.AdditionalAnswers.delegatesTo;
 import static org.mockito.Mockito.any;
@@ -30,6 +31,7 @@ import com.google.bytestream.ByteStreamProto.QueryWriteStatusRequest;
 import com.google.bytestream.ByteStreamProto.QueryWriteStatusResponse;
 import com.google.bytestream.ByteStreamProto.WriteRequest;
 import com.google.bytestream.ByteStreamProto.WriteResponse;
+import com.google.common.base.Functions;
 import com.google.common.base.Suppliers;
 import com.google.protobuf.ByteString;
 import io.grpc.Channel;
@@ -118,6 +120,7 @@ public class StubWriteOutputStreamTest {
             Suppliers.ofInstance(ByteStreamGrpc.newBlockingStub(channel)),
             Suppliers.ofInstance(ByteStreamGrpc.newStub(channel)),
             unimplementedResourceName,
+            Functions.identity(),
             /* expectedSize=*/ StubWriteOutputStream.UNLIMITED_EXPECTED_SIZE,
             /* autoflush=*/ true);
     assertThat(write.getCommittedSize()).isEqualTo(0);
@@ -129,6 +132,7 @@ public class StubWriteOutputStreamTest {
             Suppliers.ofInstance(ByteStreamGrpc.newBlockingStub(channel)),
             Suppliers.ofInstance(ByteStreamGrpc.newStub(channel)),
             notFoundResourceName,
+            Functions.identity(),
             /* expectedSize=*/ StubWriteOutputStream.UNLIMITED_EXPECTED_SIZE,
             /* autoflush=*/ true);
     assertThat(write.getCommittedSize()).isEqualTo(0);
@@ -143,6 +147,7 @@ public class StubWriteOutputStreamTest {
             Suppliers.ofInstance(ByteStreamGrpc.newBlockingStub(channel)),
             Suppliers.ofInstance(ByteStreamGrpc.newStub(channel)),
             resourceName,
+            Functions.identity(),
             /* expectedSize=*/ StubWriteOutputStream.UNLIMITED_EXPECTED_SIZE,
             /* autoflush=*/ true);
     ByteString content = ByteString.copyFromUtf8("Hello, World");
@@ -157,5 +162,35 @@ public class StubWriteOutputStreamTest {
     List<WriteRequest> requests = writeRequestCaptor.getAllValues();
     assertThat(requests.get(0).getWriteOffset()).isEqualTo(requests.get(1).getWriteOffset());
     assertThat(requests.get(2).getFinishWrite()).isTrue();
+  }
+
+  @Test
+  public void getOutputCallback() throws IOException {
+    String resourceName = "reset-resource";
+    StubWriteOutputStream write =
+        new StubWriteOutputStream(
+            Suppliers.ofInstance(ByteStreamGrpc.newBlockingStub(channel)),
+            Suppliers.ofInstance(ByteStreamGrpc.newStub(channel)),
+            resourceName,
+            Functions.identity(),
+            /* expectedSize=*/ StubWriteOutputStream.UNLIMITED_EXPECTED_SIZE,
+            /* autoflush=*/ true);
+    ByteString content = ByteString.copyFromUtf8("Hello, World");
+
+    boolean callbackTimedOut = false;
+    try (OutputStream out =
+        write.getOutput(
+            1,
+            MICROSECONDS,
+            () -> {
+              try {
+                Thread.sleep(1000);
+              } catch (InterruptedException e) {
+              }
+            })) {
+    } catch (Exception e) {
+      callbackTimedOut = true;
+    }
+    assertThat(callbackTimedOut).isTrue();
   }
 }

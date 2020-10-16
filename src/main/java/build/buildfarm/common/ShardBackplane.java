@@ -24,6 +24,7 @@ import build.buildfarm.common.ThreadSafety.ThreadSafe;
 import build.buildfarm.common.function.InterruptingRunnable;
 import build.buildfarm.v1test.DispatchedOperation;
 import build.buildfarm.v1test.ExecuteEntry;
+import build.buildfarm.v1test.GetClientStartTimeResult;
 import build.buildfarm.v1test.OperationsStatus;
 import build.buildfarm.v1test.QueueEntry;
 import build.buildfarm.v1test.ShardWorker;
@@ -59,7 +60,7 @@ public interface ShardBackplane {
 
   /** Start the backplane's operation */
   @ThreadSafe
-  void start() throws IOException;
+  void start(String publicClientName) throws IOException;
 
   /** Stop the backplane's operation */
   @ThreadSafe
@@ -292,4 +293,10 @@ public interface ShardBackplane {
 
   @ThreadSafe
   OperationsStatus operationsStatus() throws IOException;
+
+  @ThreadSafe
+  Boolean propertiesEligibleForQueue(List<Platform.Property> provisions);
+
+  @ThreadSafe
+  GetClientStartTimeResult getClientStartTime(String clientKey) throws IOException;
 }

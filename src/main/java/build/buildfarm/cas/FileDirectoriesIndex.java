@@ -72,19 +72,30 @@ class FileDirectoriesIndex implements DirectoriesIndex {
       String createEntriesSql =
           "CREATE TABLE entries (\n"
               + "    path TEXT NOT NULL,\n"
-              + "    directory TEXT NOT NULL,\n"
-              + "    PRIMARY KEY (path, directory)\n"
+              + "    directory TEXT NOT NULL\n"
               + ")";
-      String createIndexSql = "CREATE INDEX path_idx ON entries (path)";
 
       try (Statement stmt = conn.createStatement()) {
         stmt.execute(createEntriesSql);
-        stmt.execute(createIndexSql);
       } catch (SQLException e) {
         throw new RuntimeException(e);
       }
 
       opened = true;
+    }
+  }
+
+  @Override
+  public synchronized void start() {
+    open();
+
+    String createPathIndexSql = "CREATE INDEX path_idx ON entries (path)";
+    String createDirectoryIndexSql = "CREATE INDEX directory_idx ON entries (directory)";
+    try (Statement stmt = conn.createStatement()) {
+      stmt.execute(createPathIndexSql);
+      stmt.execute(createDirectoryIndexSql);
+    } catch (SQLException e) {
+      throw new RuntimeException(e);
     }
   }
 
@@ -103,63 +114,71 @@ class FileDirectoriesIndex implements DirectoriesIndex {
     open();
 
     String selectSql = "SELECT directory FROM entries WHERE path = ?";
-    String deleteSql = "DELETE FROM entries where path = ?";
 
-    ImmutableSet.Builder<Digest> directories = ImmutableSet.builder();
-    try (PreparedStatement selectStatement = conn.prepareStatement(selectSql);
-        PreparedStatement deleteStatement = conn.prepareStatement(deleteSql)) {
+    ImmutableSet.Builder<Digest> directoriesBuilder = ImmutableSet.builder();
+    try (PreparedStatement selectStatement = conn.prepareStatement(selectSql)) {
       selectStatement.setString(1, entry);
       try (ResultSet rs = selectStatement.executeQuery()) {
         while (rs.next()) {
-          directories.add(DigestUtil.parseDigest(rs.getString("directory")));
+          directoriesBuilder.add(DigestUtil.parseDigest(rs.getString("directory")));
         }
       }
-      deleteStatement.setString(1, entry);
-      deleteStatement.executeUpdate();
     } catch (SQLException e) {
       throw new RuntimeException(e);
     }
-    return directories.build();
-  }
-
-  private Path path(Digest digest) {
-    return root.resolve(digest.getHash() + "_" + digest.getSizeBytes() + "_dir_inputs");
-  }
-
-  @Override
-  public synchronized Set<Digest> removeEntry(String entry) {
-    Set<Digest> directories = removeEntryDirectories(entry);
-    try {
+    // all directories featuring this entry are now invalid
+    ImmutableSet<Digest> directories = directoriesBuilder.build();
+    String deleteSql = "DELETE FROM entries where directory = ?";
+    try (PreparedStatement deleteStatement = conn.prepareStatement(deleteSql)) {
+      conn.setAutoCommit(false);
       for (Digest directory : directories) {
-        Files.delete(path(directory));
+        deleteStatement.setString(1, DigestUtil.toString(directory));
+        deleteStatement.addBatch();
       }
-    } catch (IOException e) {
+      deleteStatement.executeBatch();
+      conn.commit();
+    } catch (SQLException e) {
       throw new RuntimeException(e);
     }
     return directories;
   }
 
+  Path path(Digest digest) {
+    return root.resolve(digest.getHash() + "_" + digest.getSizeBytes() + "_dir_inputs");
+  }
+
   @Override
-  public Iterable<String> directoryEntries(Digest directory) {
+  public synchronized Set<Digest> removeEntry(String entry) throws IOException {
+    Set<Digest> directories = removeEntryDirectories(entry);
+    for (Digest directory : directories) {
+      try {
+        Files.delete(path(directory));
+      } catch (NoSuchFileException e) {
+        // ignore
+      }
+    }
+    return directories;
+  }
+
+  @Override
+  public Iterable<String> directoryEntries(Digest directory) throws IOException {
     try {
       return asCharSource(path(directory), UTF_8).readLines();
     } catch (NoSuchFileException e) {
       return ImmutableList.of();
-    } catch (IOException e) {
-      throw new RuntimeException(e);
     }
   }
 
-  private synchronized void addEntriesDirectory(Iterable<String> entries, Digest directory) {
+  private synchronized void addEntriesDirectory(Set<String> entries, Digest directory) {
     open();
 
     String digest = DigestUtil.toString(directory);
-    String insertSql = "INSERT OR IGNORE INTO entries (path, directory)\n" + "    VALUES (?,?)";
+    String insertSql = "INSERT INTO entries (path, directory) VALUES (?,?)";
     try (PreparedStatement insertStatement = conn.prepareStatement(insertSql)) {
       conn.setAutoCommit(false);
-      insertStatement.setString(1, digest);
+      insertStatement.setString(2, digest);
       for (String entry : entries) {
-        insertStatement.setString(2, entry);
+        insertStatement.setString(1, entry);
         insertStatement.addBatch();
       }
       insertStatement.executeBatch();
@@ -170,45 +189,32 @@ class FileDirectoriesIndex implements DirectoriesIndex {
   }
 
   @Override
-  public void put(Digest directory, Iterable<String> entries) {
-    try {
-      asCharSink(path(directory), UTF_8).writeLines(entries);
-    } catch (IOException e) {
-      throw new RuntimeException(e);
-    }
-    addEntriesDirectory(entries, directory);
+  public void put(Digest directory, Iterable<String> entries) throws IOException {
+    asCharSink(path(directory), UTF_8).writeLines(entries);
+    addEntriesDirectory(ImmutableSet.copyOf(entries), directory);
   }
 
   @GuardedBy("this")
-  private void removeEntriesDirectory(Iterable<String> entries, Digest directory) {
+  private void removeEntriesDirectory(Digest directory) {
     open();
 
     String digest = DigestUtil.toString(directory);
-    String deleteSql = "DELETE FROM entries WHERE path = ? AND directory = ?";
+    String deleteSql = "DELETE FROM entries WHERE directory = ?";
     try (PreparedStatement deleteStatement = conn.prepareStatement(deleteSql)) {
-      conn.setAutoCommit(false);
-      // safe for multi delete
-      deleteStatement.setString(2, digest);
-      for (String entry : entries) {
-        deleteStatement.setString(1, entry);
-        deleteStatement.executeUpdate();
-      }
-      conn.commit();
+      deleteStatement.setString(1, digest);
+      deleteStatement.executeUpdate();
     } catch (SQLException e) {
       throw new RuntimeException(e);
     }
   }
 
   @Override
-  public synchronized void remove(Digest directory) {
-    Iterable<String> entries = directoryEntries(directory);
+  public synchronized void remove(Digest directory) throws IOException {
     try {
       Files.delete(path(directory));
     } catch (NoSuchFileException e) {
       // ignore
-    } catch (IOException e) {
-      throw new RuntimeException(e);
     }
-    removeEntriesDirectory(entries, directory);
+    removeEntriesDirectory(directory);
   }
 }

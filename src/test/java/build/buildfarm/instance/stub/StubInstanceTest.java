@@ -16,9 +16,10 @@ package build.buildfarm.instance.stub;
 
 import static com.google.common.base.Preconditions.checkState;
 import static com.google.common.truth.Truth.assertThat;
-import static com.google.common.util.concurrent.MoreExecutors.newDirectExecutorService;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyZeroInteractions;
 
 import build.bazel.remote.execution.v2.Action;
@@ -38,6 +39,7 @@ import build.buildfarm.common.DigestUtil;
 import build.buildfarm.common.DigestUtil.ActionKey;
 import build.buildfarm.common.Write;
 import build.buildfarm.instance.Instance;
+import build.buildfarm.instance.stub.StubInstance.ReadBlobInterchange;
 import com.google.bytestream.ByteStreamGrpc.ByteStreamImplBase;
 import com.google.bytestream.ByteStreamProto.QueryWriteStatusRequest;
 import com.google.bytestream.ByteStreamProto.QueryWriteStatusResponse;
@@ -54,6 +56,8 @@ import io.grpc.Status;
 import io.grpc.Status.Code;
 import io.grpc.inprocess.InProcessChannelBuilder;
 import io.grpc.inprocess.InProcessServerBuilder;
+import io.grpc.stub.ClientCallStreamObserver;
+import io.grpc.stub.ServerCallStreamObserver;
 import io.grpc.stub.StreamObserver;
 import io.grpc.util.MutableHandlerRegistry;
 import java.io.ByteArrayOutputStream;
@@ -67,6 +71,7 @@ import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
+import org.mockito.ArgumentCaptor;
 
 @RunWith(JUnit4.class)
 public class StubInstanceTest {
@@ -186,11 +191,7 @@ public class StubInstanceTest {
     Instance instance = newStubInstance("findMissingBlobs-test");
     Iterable<Digest> digests =
         ImmutableList.of(Digest.newBuilder().setHash("present").setSizeBytes(1).build());
-    assertThat(
-            instance
-                .findMissingBlobs(
-                    digests, newDirectExecutorService(), RequestMetadata.getDefaultInstance())
-                .get())
+    assertThat(instance.findMissingBlobs(digests, RequestMetadata.getDefaultInstance()).get())
         .isEmpty();
     instance.stop();
   }
@@ -442,5 +443,23 @@ public class StubInstanceTest {
     assertThat(status.getCode()).isEqualTo(Code.DEADLINE_EXCEEDED);
     verifyZeroInteractions(out);
     instance.stop();
+  }
+
+  @Test
+  public void readBlobInterchangeDoesNotRequestUntilStarted() {
+    ServerCallStreamObserver<ByteString> mockBlobObserver = mock(ServerCallStreamObserver.class);
+    ReadBlobInterchange interchange = new ReadBlobInterchange(mockBlobObserver);
+
+    ClientCallStreamObserver<ReadRequest> mockRequestStream = mock(ClientCallStreamObserver.class);
+    interchange.beforeStart(mockRequestStream);
+    // verify our flow control call so that we can verify no further interactions
+    verify(mockRequestStream, times(1)).disableAutoInboundFlowControl();
+    // capture onReady from mockBlobObserver
+    ArgumentCaptor<Runnable> onReadyCaptor = ArgumentCaptor.forClass(Runnable.class);
+    verify(mockBlobObserver, times(1)).setOnReadyHandler(onReadyCaptor.capture());
+    // call it
+    onReadyCaptor.getValue().run();
+    // verify zero interactions with mockRequestStream
+    verifyZeroInteractions(mockRequestStream);
   }
 }

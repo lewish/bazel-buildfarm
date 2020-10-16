@@ -19,7 +19,6 @@ import static build.buildfarm.common.Actions.checkPreconditionFailure;
 import static build.buildfarm.common.Actions.satisfiesRequirements;
 import static build.buildfarm.common.Errors.VIOLATION_TYPE_INVALID;
 import static build.buildfarm.common.Errors.VIOLATION_TYPE_MISSING;
-import static com.google.common.collect.Maps.uniqueIndex;
 import static java.lang.String.format;
 import static java.util.concurrent.TimeUnit.DAYS;
 
@@ -34,12 +33,10 @@ import build.bazel.remote.execution.v2.ExecutionStage;
 import build.bazel.remote.execution.v2.FileNode;
 import build.bazel.remote.execution.v2.OutputFile;
 import build.bazel.remote.execution.v2.Platform;
-import build.bazel.remote.execution.v2.RequestMetadata;
 import build.bazel.remote.execution.v2.Tree;
-import build.buildfarm.cas.ContentAddressableStorage.Blob;
-import build.buildfarm.cas.ContentAddressableStorage.EntryLimitException;
 import build.buildfarm.common.DigestUtil;
 import build.buildfarm.common.DigestUtil.ActionKey;
+import build.buildfarm.common.EntryLimitException;
 import build.buildfarm.common.InputStreamFactory;
 import build.buildfarm.common.Poller;
 import build.buildfarm.common.ShardBackplane;
@@ -53,6 +50,7 @@ import build.buildfarm.v1test.ExecutionPolicy;
 import build.buildfarm.v1test.QueueEntry;
 import build.buildfarm.v1test.QueuedOperation;
 import build.buildfarm.v1test.QueuedOperationMetadata;
+import build.buildfarm.worker.ExecutionPolicies;
 import build.buildfarm.worker.RetryingMatchListener;
 import build.buildfarm.worker.Utils;
 import build.buildfarm.worker.WorkerContext;
@@ -64,10 +62,10 @@ import com.google.common.base.Throwables;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSetMultimap;
+import com.google.common.collect.ListMultimap;
 import com.google.common.collect.Maps;
 import com.google.common.collect.SetMultimap;
 import com.google.common.collect.Sets;
-import com.google.common.io.ByteStreams;
 import com.google.longrunning.Operation;
 import com.google.protobuf.Any;
 import com.google.protobuf.ByteString;
@@ -76,12 +74,9 @@ import com.google.protobuf.InvalidProtocolBufferException;
 import com.google.rpc.PreconditionFailure;
 import io.grpc.Deadline;
 import io.grpc.Status;
-import io.grpc.Status.Code;
 import io.grpc.StatusException;
-import io.grpc.StatusRuntimeException;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.OutputStream;
 import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
@@ -95,13 +90,15 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.Stack;
-import java.util.UUID;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
 class ShardWorkerContext implements WorkerContext {
   private static final Logger logger = Logger.getLogger(ShardWorkerContext.class.getName());
+
+  private static final String PROVISION_CORES_NAME = "cores";
 
   private final String name;
   private final Platform platform;
@@ -114,7 +111,7 @@ class ShardWorkerContext implements WorkerContext {
   private final ShardBackplane backplane;
   private final ExecFileSystem execFileSystem;
   private final InputStreamFactory inputStreamFactory;
-  private final Map<String, ExecutionPolicy> policies;
+  private final ListMultimap<String, ExecutionPolicy> policies;
   private final Instance instance;
   private final long deadlineAfter;
   private final TimeUnit deadlineAfterUnits;
@@ -126,20 +123,16 @@ class ShardWorkerContext implements WorkerContext {
   private final Map<String, QueueEntry> activeOperations = Maps.newConcurrentMap();
   private final Group executionsGroup = Group.getRoot().getChild("executions");
   private final Group operationsGroup = executionsGroup.getChild("operations");
+  private final Supplier<CasWriter> writer;
 
   static SetMultimap<String, String> getMatchProvisions(
-      Platform platform, Iterable<ExecutionPolicy> policyNames, int executeStageWidth) {
+      Platform platform, Iterable<ExecutionPolicy> policies, int executeStageWidth) {
     ImmutableSetMultimap.Builder<String, String> provisions = ImmutableSetMultimap.builder();
-    for (Platform.Property property : platform.getPropertiesList()) {
+    Platform matchPlatform = ExecutionPolicies.getMatchPlatform(platform, policies);
+    for (Platform.Property property : matchPlatform.getPropertiesList()) {
       provisions.put(property.getName(), property.getValue());
     }
-    for (ExecutionPolicy policy : policyNames) {
-      String name = policy.getName();
-      if (!name.isEmpty()) {
-        provisions.put("execution-policy", name);
-      }
-    }
-    provisions.put("cores", String.format("%d", executeStageWidth));
+    provisions.put(PROVISION_CORES_NAME, String.format("%d", executeStageWidth));
     return provisions.build();
   }
 
@@ -162,7 +155,8 @@ class ShardWorkerContext implements WorkerContext {
       Duration maximumActionTimeout,
       boolean limitExecution,
       boolean limitGlobalExecution,
-      boolean onlyMulticoreTests) {
+      boolean onlyMulticoreTests,
+      Supplier<CasWriter> writer) {
     this.name = name;
     this.platform = platform;
     this.matchProvisions = getMatchProvisions(platform, policies, executeStageWidth);
@@ -174,7 +168,7 @@ class ShardWorkerContext implements WorkerContext {
     this.backplane = backplane;
     this.execFileSystem = execFileSystem;
     this.inputStreamFactory = inputStreamFactory;
-    this.policies = uniqueIndex(policies, (policy) -> policy.getName());
+    this.policies = ExecutionPolicies.toMultimap(policies);
     this.instance = instance;
     this.deadlineAfter = deadlineAfter;
     this.deadlineAfterUnits = deadlineAfterUnits;
@@ -183,6 +177,7 @@ class ShardWorkerContext implements WorkerContext {
     this.limitExecution = limitExecution;
     this.limitGlobalExecution = limitGlobalExecution;
     this.onlyMulticoreTests = onlyMulticoreTests;
+    this.writer = writer;
     Preconditions.checkState(
         !limitGlobalExecution || limitExecution,
         "limit_global_execution is meaningless without limit_execution");
@@ -260,11 +255,8 @@ class ShardWorkerContext implements WorkerContext {
   private ByteString getBlob(Digest digest) throws IOException, InterruptedException {
     try (InputStream in = inputStreamFactory.newInput(digest, 0)) {
       return ByteString.readFrom(in);
-    } catch (StatusRuntimeException e) {
-      if (e.getStatus().equals(Status.NOT_FOUND)) {
-        return null;
-      }
-      throw e;
+    } catch (NoSuchFileException e) {
+      return null;
     }
   }
 
@@ -296,10 +288,17 @@ class ShardWorkerContext implements WorkerContext {
       queueEntry = backplane.dispatchOperation(platform.getPropertiesList());
     } catch (IOException e) {
       Status status = Status.fromThrowable(e);
-      if (status.getCode() != Code.UNAVAILABLE) {
-        throw e;
+      switch (status.getCode()) {
+        case DEADLINE_EXCEEDED:
+          logger.log(Level.WARNING, "backplane timed out for match during bookkeeping");
+          break;
+        case UNAVAILABLE:
+          logger.log(Level.WARNING, "backplane was unavailable for match");
+          break;
+        default:
+          throw e;
       }
-      // unavailable backplane will propagate a null queueEntry
+      // transient backplane errors will propagate a null queueEntry
     }
     listener.onWaitEnd();
     if (queueEntry == null || satisfiesRequirements(matchProvisions, queueEntry.getPlatform())) {
@@ -480,35 +479,20 @@ class ShardWorkerContext implements WorkerContext {
     return maximumActionTimeout;
   }
 
-  private void insertBlob(Digest digest, ByteString content) throws InterruptedException {
+  private void insertBlob(Digest digest, ByteString content)
+      throws IOException, InterruptedException {
     if (digest.getSizeBytes() > 0) {
-      Blob blob = new Blob(content, digest);
-      execFileSystem.getStorage().put(blob);
+      writer.get().insertBlob(digest, content);
     }
   }
 
   private void insertFile(Digest digest, Path file) throws IOException, InterruptedException {
-    Write write =
-        execFileSystem
-            .getStorage()
-            .getWrite(digest, UUID.randomUUID(), RequestMetadata.getDefaultInstance());
-    try (OutputStream out = write.getOutput(deadlineAfter, deadlineAfterUnits, () -> {});
-        InputStream in = Files.newInputStream(file)) {
-      ByteStreams.copy(in, out);
-    } catch (IOException e) {
-      // complete writes should be ignored
-      if (!write.isComplete()) {
-        write.reset(); // we will not attempt retry with current behavior, abandon progress
-        if (e.getCause() != null) {
-          Throwables.propagateIfInstanceOf(e.getCause(), InterruptedException.class);
-        }
-        throw e;
-      }
-    }
+
+    writer.get().write(digest, file);
   }
 
   private void updateActionResultStdOutputs(ActionResult.Builder resultBuilder)
-      throws InterruptedException {
+      throws IOException, InterruptedException {
     ByteString stdoutRaw = resultBuilder.getStdoutRaw();
     if (stdoutRaw.size() > 0) {
       // reset to allow policy to determine inlining
@@ -730,7 +714,6 @@ class ShardWorkerContext implements WorkerContext {
     for (String outputFile : outputFiles) {
       uploadOutputFile(resultBuilder, outputFile, actionRoot, preconditionFailure);
     }
-
     for (String outputDir : outputDirs) {
       uploadOutputDirectory(resultBuilder, outputDir, actionRoot, preconditionFailure);
     }
@@ -745,7 +728,7 @@ class ShardWorkerContext implements WorkerContext {
   }
 
   @Override
-  public ExecutionPolicy getExecutionPolicy(String name) {
+  public Iterable<ExecutionPolicy> getExecutionPolicies(String name) {
     return policies.get(name);
   }
 

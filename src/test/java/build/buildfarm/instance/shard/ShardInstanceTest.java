@@ -18,12 +18,16 @@ import static build.bazel.remote.execution.v2.ExecutionStage.Value.CACHE_CHECK;
 import static build.bazel.remote.execution.v2.ExecutionStage.Value.COMPLETED;
 import static build.bazel.remote.execution.v2.ExecutionStage.Value.QUEUED;
 import static build.buildfarm.common.Actions.invalidActionVerboseMessage;
+import static build.buildfarm.common.Errors.VIOLATION_TYPE_INVALID;
 import static build.buildfarm.common.Errors.VIOLATION_TYPE_MISSING;
+import static build.buildfarm.instance.AbstractServerInstance.INVALID_PLATFORM;
 import static build.buildfarm.instance.AbstractServerInstance.MISSING_ACTION;
 import static build.buildfarm.instance.AbstractServerInstance.MISSING_COMMAND;
 import static com.google.common.truth.Truth.assertThat;
 import static com.google.common.util.concurrent.Futures.immediateFuture;
+import static com.google.common.util.concurrent.MoreExecutors.listeningDecorator;
 import static com.google.common.util.concurrent.MoreExecutors.newDirectExecutorService;
+import static java.util.concurrent.Executors.newSingleThreadExecutor;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.mockito.AdditionalAnswers.answer;
 import static org.mockito.ArgumentMatchers.argThat;
@@ -87,7 +91,6 @@ import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Executor;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -95,6 +98,7 @@ import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
 import org.mockito.ArgumentCaptor;
 import org.mockito.ArgumentMatcher;
+import org.mockito.Matchers;
 import org.mockito.Mock;
 import org.mockito.MockitoAnnotations;
 import org.mockito.invocation.InvocationOnMock;
@@ -122,19 +126,23 @@ public class ShardInstanceTest {
   public void setUp() throws InterruptedException {
     MockitoAnnotations.initMocks(this);
     blobDigests = Sets.newHashSet();
+    ReadThroughActionCache actionCache =
+        new ShardActionCache(10, mockBackplane, newDirectExecutorService());
     instance =
         new ShardInstance(
             "shard",
             DIGEST_UTIL,
             mockBackplane,
+            actionCache,
             /* runDispatchedMonitor=*/ false,
             /* dispatchedMonitorIntervalSeconds=*/ 0,
             /* runOperationQueuer=*/ false,
             /* maxBlobSize=*/ 0,
             /* maxActionTimeout=*/ Duration.getDefaultInstance(),
             mockOnStop,
-            CacheBuilder.newBuilder().build(mockInstanceLoader));
-    instance.start();
+            CacheBuilder.newBuilder().build(mockInstanceLoader),
+            /* actionCacheFetchService=*/ listeningDecorator(newSingleThreadExecutor()));
+    instance.start("startTime/test:0000");
   }
 
   @After
@@ -190,7 +198,7 @@ public class ShardInstanceTest {
               }
             })
         .when(mockWorkerInstance)
-        .findMissingBlobs(any(Iterable.class), any(Executor.class), any(RequestMetadata.class));
+        .findMissingBlobs(any(Iterable.class), any(RequestMetadata.class));
 
     Action action =
         Action.newBuilder()
@@ -229,7 +237,7 @@ public class ShardInstanceTest {
     when(mockBackplane.getBlobLocationSet(eq(actionDigest)))
         .thenReturn(provideAction ? workers : ImmutableSet.of());
     when(mockWorkerInstance.findMissingBlobs(
-            eq(ImmutableList.of(actionDigest)), any(Executor.class), any(RequestMetadata.class)))
+            eq(ImmutableList.of(actionDigest)), any(RequestMetadata.class)))
         .thenReturn(immediateFuture(ImmutableList.of()));
 
     return action;
@@ -290,6 +298,69 @@ public class ShardInstanceTest {
                     .setType(VIOLATION_TYPE_MISSING)
                     .setSubject("blobs/" + DigestUtil.toString(actionDigest))
                     .setDescription(MISSING_ACTION))
+            .build();
+    ExecuteResponse executeResponse =
+        ExecuteResponse.newBuilder()
+            .setStatus(
+                com.google.rpc.Status.newBuilder()
+                    .setCode(Code.FAILED_PRECONDITION.getNumber())
+                    .setMessage(invalidActionVerboseMessage(actionDigest, preconditionFailure))
+                    .addDetails(Any.pack(preconditionFailure)))
+            .build();
+    assertResponse(executeResponse);
+    verify(poller, atLeastOnce()).pause();
+  }
+
+  @Test
+  public void queueActionFailsQueueEligibility() throws Exception {
+    ByteString foo = ByteString.copyFromUtf8("foo");
+    Digest fooDigest = DIGEST_UTIL.compute(ByteString.copyFromUtf8("foo"));
+    // no need to provide foo, just want to make a non-default directory
+    Directory subdir =
+        Directory.newBuilder()
+            .addFiles(FileNode.newBuilder().setName("foo").setDigest(fooDigest))
+            .build();
+    Digest subdirDigest = DIGEST_UTIL.compute(foo);
+    Directory inputRoot = Directory.newBuilder().build();
+    ByteString inputRootContent = inputRoot.toByteString();
+    Digest inputRootDigest = DIGEST_UTIL.compute(inputRootContent);
+    provideBlob(inputRootDigest, inputRootContent);
+    Action action = createAction(true, true, inputRootDigest, SIMPLE_COMMAND);
+    Digest actionDigest = DIGEST_UTIL.compute(action);
+
+    ExecuteEntry executeEntry =
+        ExecuteEntry.newBuilder()
+            .setOperationName("missing-directory-operation")
+            .setActionDigest(actionDigest)
+            .setSkipCacheLookup(true)
+            .build();
+
+    when(mockBackplane.propertiesEligibleForQueue(Matchers.anyList())).thenReturn(false);
+
+    when(mockBackplane.canQueue()).thenReturn(true);
+
+    Poller poller = mock(Poller.class);
+
+    boolean failedPreconditionExceptionCaught = false;
+    try {
+      instance.queue(executeEntry, poller).get(QUEUE_TEST_TIMEOUT_SECONDS, SECONDS);
+    } catch (ExecutionException e) {
+      com.google.rpc.Status status = StatusProto.fromThrowable(e);
+      if (status.getCode() == Code.FAILED_PRECONDITION.getNumber()) {
+        failedPreconditionExceptionCaught = true;
+      } else {
+        e.getCause().printStackTrace();
+      }
+    }
+    assertThat(failedPreconditionExceptionCaught).isTrue();
+
+    PreconditionFailure preconditionFailure =
+        PreconditionFailure.newBuilder()
+            .addViolations(
+                Violation.newBuilder()
+                    .setType(VIOLATION_TYPE_INVALID)
+                    .setSubject(INVALID_PLATFORM)
+                    .setDescription("properties are not valid for queue eligibility: []"))
             .build();
     ExecuteResponse executeResponse =
         ExecuteResponse.newBuilder()
@@ -392,6 +463,8 @@ public class ShardInstanceTest {
             .setSkipCacheLookup(true)
             .build();
 
+    when(mockBackplane.propertiesEligibleForQueue(Matchers.anyList())).thenReturn(true);
+
     when(mockBackplane.canQueue()).thenReturn(true);
 
     Poller poller = mock(Poller.class);
@@ -434,8 +507,7 @@ public class ShardInstanceTest {
     Action action = createAction();
     Digest actionDigest = DIGEST_UTIL.compute(action);
 
-    when(mockWorkerInstance.findMissingBlobs(
-            any(Iterable.class), any(Executor.class), any(RequestMetadata.class)))
+    when(mockWorkerInstance.findMissingBlobs(any(Iterable.class), any(RequestMetadata.class)))
         .thenReturn(immediateFuture(ImmutableList.of()));
 
     doAnswer(answer((digest, uuid) -> new NullWrite()))
@@ -456,6 +528,8 @@ public class ShardInstanceTest {
             .setActionDigest(actionDigest)
             .setSkipCacheLookup(true)
             .build();
+
+    when(mockBackplane.propertiesEligibleForQueue(Matchers.anyList())).thenReturn(true);
 
     when(mockBackplane.canQueue()).thenReturn(true);
 
@@ -518,6 +592,8 @@ public class ShardInstanceTest {
             .setOperationName("operation-with-erroring-action-result")
             .setActionDigest(actionKey.getDigest())
             .build();
+
+    when(mockBackplane.propertiesEligibleForQueue(Matchers.anyList())).thenReturn(true);
 
     when(mockBackplane.canQueue()).thenReturn(true);
 
@@ -634,6 +710,8 @@ public class ShardInstanceTest {
     Digest missingDirectoryDigest =
         Digest.newBuilder().setHash("missing-directory").setSizeBytes(1).build();
 
+    when(mockBackplane.propertiesEligibleForQueue(Matchers.anyList())).thenReturn(true);
+
     when(mockBackplane.getOperation(eq(operationName)))
         .thenReturn(
             Operation.newBuilder()
@@ -732,10 +810,7 @@ public class ShardInstanceTest {
     Digest digest = Digest.newBuilder().setHash("hash").setSizeBytes(1).build();
     Iterable<Digest> missingDigests =
         instance
-            .findMissingBlobs(
-                ImmutableList.of(digest),
-                newDirectExecutorService(),
-                RequestMetadata.getDefaultInstance())
+            .findMissingBlobs(ImmutableList.of(digest), RequestMetadata.getDefaultInstance())
             .get();
     assertThat(missingDigests).containsExactly(digest);
   }
@@ -752,16 +827,12 @@ public class ShardInstanceTest {
     List<Digest> queryDigests = ImmutableList.of(digest);
     ArgumentMatcher<Iterable<Digest>> queryMatcher =
         (digests) -> Iterables.elementsEqual(digests, queryDigests);
-    when(mockWorkerInstance.findMissingBlobs(
-            argThat(queryMatcher), any(Executor.class), any(RequestMetadata.class)))
+    when(mockWorkerInstance.findMissingBlobs(argThat(queryMatcher), any(RequestMetadata.class)))
         .thenReturn(immediateFuture(queryDigests));
     Iterable<Digest> missingDigests =
-        instance
-            .findMissingBlobs(
-                queryDigests, newDirectExecutorService(), RequestMetadata.getDefaultInstance())
-            .get();
+        instance.findMissingBlobs(queryDigests, RequestMetadata.getDefaultInstance()).get();
     verify(mockWorkerInstance, times(1))
-        .findMissingBlobs(argThat(queryMatcher), any(Executor.class), any(RequestMetadata.class));
+        .findMissingBlobs(argThat(queryMatcher), any(RequestMetadata.class));
     assertThat(missingDigests).containsExactly(digest);
   }
 
@@ -857,8 +928,10 @@ public class ShardInstanceTest {
     actionResultWatcher.observe(completedOperation);
 
     verify(mockWatcher, never()).observe(operation);
-    assertThat(instance.getActionResult(actionKey, RequestMetadata.getDefaultInstance()).get())
-        .isNull();
+    ListenableFuture<ActionResult> resultFuture =
+        instance.getActionResult(actionKey, RequestMetadata.getDefaultInstance());
+    ActionResult result = resultFuture.get();
+    assertThat(result).isNull();
     verify(mockWatcher, times(1)).observe(completedOperation);
   }
 

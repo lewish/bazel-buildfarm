@@ -25,7 +25,6 @@ import build.bazel.remote.execution.v2.Command;
 import build.bazel.remote.execution.v2.Command.EnvironmentVariable;
 import build.bazel.remote.execution.v2.ExecuteOperationMetadata;
 import build.bazel.remote.execution.v2.ExecutionStage;
-import build.bazel.remote.execution.v2.Platform;
 import build.bazel.remote.execution.v2.Platform.Property;
 import build.buildfarm.common.Write;
 import build.buildfarm.common.Write.NullWrite;
@@ -61,6 +60,7 @@ class Executor {
   private final OperationContext operationContext;
   private final ExecuteActionStage owner;
   private int exitCode = INCOMPLETE_EXIT_CODE;
+  private boolean wasErrored = false;
 
   Executor(
       WorkerContext workerContext, OperationContext operationContext, ExecuteActionStage owner) {
@@ -69,7 +69,17 @@ class Executor {
     this.owner = owner;
   }
 
+  // ensure that only one error put attempt occurs
+  private void putError() throws InterruptedException {
+    if (!wasErrored) {
+      wasErrored = true;
+      owner.error().put(operationContext);
+    }
+  }
+
   private long runInterruptible(Stopwatch stopwatch) throws InterruptedException {
+    long startedAt = System.currentTimeMillis();
+
     ExecuteOperationMetadata metadata;
     try {
       metadata = operationContext.operation.getMetadata().unpack(ExecuteOperationMetadata.class);
@@ -80,7 +90,9 @@ class Executor {
     ExecuteOperationMetadata executingMetadata =
         metadata.toBuilder().setStage(ExecutionStage.Value.EXECUTING).build();
 
-    long startedAt = System.currentTimeMillis();
+    Iterable<ExecutionPolicy> policies =
+        ExecutionPolicies.forPlatform(
+            operationContext.command.getPlatform(), workerContext::getExecutionPolicies);
 
     Operation operation =
         operationContext
@@ -110,7 +122,7 @@ class Executor {
           Level.WARNING,
           String.format(
               "Executor::run(%s): could not transition to EXECUTING", operation.getName()));
-      owner.error().put(operationContext);
+      putError();
       return 0;
     }
 
@@ -147,29 +159,21 @@ class Executor {
         pollDeadline);
 
     try {
-      return executePolled(operation, timeout, isDefaultTimeout, stopwatch);
+      return executePolled(operation, policies, timeout, isDefaultTimeout, stopwatch);
     } finally {
       operationContext.poller.pause();
     }
   }
 
   private long executePolled(
-      Operation operation, Duration timeout, boolean isDefaultTimeout, Stopwatch stopwatch)
+      Operation operation,
+      Iterable<ExecutionPolicy> policies,
+      Duration timeout,
+      boolean isDefaultTimeout,
+      Stopwatch stopwatch)
       throws InterruptedException {
     /* execute command */
     workerContext.logInfo("Executor: Operation " + operation.getName() + " Executing command");
-
-    Platform platform = operationContext.command.getPlatform();
-    ImmutableList.Builder<ExecutionPolicy> policies = ImmutableList.builder();
-    ExecutionPolicy defaultPolicy = workerContext.getExecutionPolicy("");
-    if (defaultPolicy != null) {
-      policies.add(defaultPolicy);
-    }
-    for (Property property : platform.getPropertiesList()) {
-      if (property.getName().equals("execution-policy")) {
-        policies.add(workerContext.getExecutionPolicy(property.getValue()));
-      }
-    }
 
     ActionResult.Builder resultBuilder = operationContext.executeResponse.getResultBuilder();
     resultBuilder
@@ -188,7 +192,7 @@ class Executor {
     final Code statusCode;
     try (IOResource resource =
         workerContext.limitExecution(operationName, arguments, operationContext.command)) {
-      for (ExecutionPolicy policy : policies.build()) {
+      for (ExecutionPolicy policy : policies) {
         if (policy.getPolicyCase() == WRAPPER) {
           arguments.addAll(transformWrapper(policy.getWrapper()));
         }
@@ -209,7 +213,7 @@ class Executor {
     } catch (IOException e) {
       logger.log(Level.SEVERE, format("error executing operation %s", operationName), e);
       operationContext.poller.pause();
-      owner.error().put(operationContext);
+      putError();
       return 0;
     }
 
@@ -247,11 +251,10 @@ class Executor {
         throw e;
       }
     } else {
-      // FIXME we need to release the action root
       workerContext.logInfo("Executor: Operation " + operationName + " Failed to claim output");
       boolean wasInterrupted = Thread.interrupted();
       try {
-        owner.error().put(operationContext);
+        putError();
       } finally {
         if (wasInterrupted) {
           Thread.currentThread().interrupt();
@@ -270,7 +273,7 @@ class Executor {
     } catch (InterruptedException e) {
       /* we can be interrupted when the poller fails */
       try {
-        owner.error().put(operationContext);
+        putError();
       } catch (InterruptedException errorEx) {
         logger.log(Level.SEVERE, format("interrupted while erroring %s", operationName), errorEx);
       } finally {
@@ -281,7 +284,7 @@ class Executor {
       boolean wasInterrupted = Thread.interrupted();
       logger.log(Level.SEVERE, format("errored during execution of %s", operationName), e);
       try {
-        owner.error().put(operationContext);
+        putError();
       } catch (InterruptedException errorEx) {
         logger.log(
             Level.SEVERE,

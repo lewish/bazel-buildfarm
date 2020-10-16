@@ -95,7 +95,8 @@ class CFCExecFileSystem implements ExecFileSystem {
   }
 
   @Override
-  public void start(Consumer<List<Digest>> onDigests) throws IOException, InterruptedException {
+  public void start(Consumer<List<Digest>> onDigests, boolean skipLoad)
+      throws IOException, InterruptedException {
     List<Dirent> dirents = null;
     try {
       dirents = readdir(root, /* followSymlinks= */ false);
@@ -115,7 +116,7 @@ class CFCExecFileSystem implements ExecFileSystem {
     }
 
     ImmutableList.Builder<Digest> blobDigests = ImmutableList.builder();
-    fileCache.start(blobDigests::add, removeDirectoryService);
+    fileCache.start(blobDigests::add, removeDirectoryService, skipLoad);
     onDigests.accept(blobDigests.build());
 
     getInterruptiblyOrIOException(allAsList(removeDirectoryFutures.build()));
@@ -283,7 +284,10 @@ class CFCExecFileSystem implements ExecFileSystem {
       String operationName, Map<Digest, Directory> directoriesIndex, Action action, Command command)
       throws IOException, InterruptedException {
     OutputDirectory outputDirectory =
-        OutputDirectory.parse(command.getOutputFilesList(), command.getOutputDirectoriesList());
+        OutputDirectory.parse(
+            command.getOutputFilesList(),
+            command.getOutputDirectoriesList(),
+            command.getEnvironmentVariablesList());
 
     Path execDir = root.resolve(operationName);
     if (Files.exists(execDir)) {

@@ -1,4 +1,4 @@
-// Copyright 2020 The Bazel Authors. All rights reserved.
+// Copyright 2018 The Bazel Authors. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,13 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package build.buildfarm.common.metrics;
+package build.buildfarm.worker.shard;
 
-import build.bazel.remote.execution.v2.RequestMetadata;
-import com.google.longrunning.Operation;
+import build.bazel.remote.execution.v2.Digest;
+import com.google.protobuf.ByteString;
+import java.io.IOException;
+import java.nio.file.Path;
 
-public interface MetricsPublisher {
-  void publishRequestMetadata(Operation operation, RequestMetadata requestMetadata);
+public interface CasWriter {
+  public void write(Digest digest, Path file) throws IOException, InterruptedException;
 
-  void publishMetric(String metricName, Object metricValue);
+  public void insertBlob(Digest digest, ByteString content)
+      throws IOException, InterruptedException;
 }

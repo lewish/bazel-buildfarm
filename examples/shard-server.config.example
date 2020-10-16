@@ -56,6 +56,9 @@ instances {
       # be a single URI, regardless of the layout of the cluster
       redis_uri: "redis://localhost:6379"
 
+      # The password used to authenticate redis clients, if required
+      # redis_password: "mypass"
+
       # The size of the redis connection pool
       jedis_pool_max_total: 4000
 
@@ -87,6 +90,9 @@ instances {
       # than a catastrophic failure.
       action_blacklist_prefix: "ActionBlacklist"
 
+      # The ttl maintained for action_blacklist entries.
+      action_blacklist_expire: 3600 # 1 hour
+
       # A redis key prefix for all blacklisted invocations, suffixed
       # with the tool invocation id. Requests on behalf of an invocation
       # which is blacklisted should be rejected where it is identified via
@@ -96,9 +102,6 @@ instances {
       # case, can induce a fallback to non-remote recovery, rather
       # than a catastrophic failure.
       invocation_blacklist_prefix: "InvocationBlacklist"
-
-      # The ttl maintained for action_blacklist entries.
-      action_blacklist_expire: 3600 # 1 hour
 
       # A redis key prefix for all Operations, suffixed with the
       # operation's name and mapping to an Operation which reflects
@@ -213,6 +216,27 @@ instances {
       # safety check for the backplane storage.
       # Redis cluster storage size should influence safe values here.
       max_pre_queue_depth: 1000000
+
+      # Specify a queue that supports min/max cpu core specification
+      provisioned_queues: {
+        queues: {
+          name: "cpu"
+
+          platform: {
+            # Any specification (including non-specification) of min/max-cores
+            # will be allowed to support cpu controls and worker resource
+            # delegation.
+            properties: {
+              name: "min-cores"
+              value: "*"
+            }
+            properties: {
+              name: "max-cores"
+              value: "*"
+            }
+          }
+        }
+      }
     }
   }
 }

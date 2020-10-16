@@ -15,7 +15,6 @@
 package build.buildfarm;
 
 import static build.buildfarm.instance.Utils.getBlob;
-import static com.google.common.util.concurrent.MoreExecutors.directExecutor;
 import static com.google.common.util.concurrent.MoreExecutors.shutdownAndAwaitTermination;
 import static java.lang.String.format;
 import static java.util.concurrent.Executors.newSingleThreadScheduledExecutor;
@@ -144,6 +143,7 @@ class Cat {
       }
     }
     indentOut(level, "Platform: " + command.getPlatform());
+    indentOut(level, "WorkingDirectory: " + command.getWorkingDirectory());
   }
 
   private static void indentOut(int level, String msg) {
@@ -233,9 +233,7 @@ class Cat {
       throws ExecutionException, InterruptedException {
     Stopwatch stopwatch = Stopwatch.createStarted();
     Iterable<Digest> missingDigests =
-        instance
-            .findMissingBlobs(digests, directExecutor(), RequestMetadata.getDefaultInstance())
-            .get();
+        instance.findMissingBlobs(digests, RequestMetadata.getDefaultInstance()).get();
     long elapsedMicros = stopwatch.elapsed(TimeUnit.MICROSECONDS);
 
     boolean missing = false;
@@ -613,18 +611,29 @@ class Cat {
   private static void getWorkerProfile(Instance instance) {
     WorkerProfileMessage response = instance.getWorkerProfile();
     System.out.println("\nWorkerProfile:");
-    String strNumFormat = "%-50s : %d";
+    String strIntFormat = "%-50s : %d";
+    String strFloatFormat = "%-50s : %2.1f";
+    long entryCount = response.getCasEntryCount();
+    long unreferencedEntryCount = response.getCasUnreferencedEntryCount();
+    System.out.println(String.format(strIntFormat, "Current Total Entry Count", entryCount));
     System.out.println(
-        String.format(strNumFormat, "Current Entry Count", response.getCasEntryCount()));
+        String.format(strIntFormat, "Current Unreferenced Entry Count", unreferencedEntryCount));
+    if (entryCount != 0) {
+      System.out.println(
+          String.format(
+              strFloatFormat,
+              "Percentage of Unreferenced Entry",
+              1.0 * response.getCasEntryCount() / response.getCasUnreferencedEntryCount()));
+    }
     System.out.println(
         String.format(
-            strNumFormat, "Current DirectoryEntry Count", response.getCasDirectoryEntryCount()));
+            strIntFormat, "Current DirectoryEntry Count", response.getCasDirectoryEntryCount()));
     System.out.println(
         String.format(
-            strNumFormat, "Number of Evicted Entries", response.getCasEvictedEntryCount()));
+            strIntFormat, "Number of Evicted Entries", response.getCasEvictedEntryCount()));
     System.out.println(
         String.format(
-            strNumFormat,
+            strIntFormat,
             "Total Evicted Entries size in Bytes",
             response.getCasEvictedEntrySize()));
 
@@ -746,7 +755,7 @@ class Cat {
       throws Exception {
     ManagedChannel channel = createChannel(host);
     Instance instance =
-        new StubInstance(instanceName, "bf-cat", digestUtil, channel, 10, TimeUnit.SECONDS);
+        new StubInstance(instanceName, "bf-cat", digestUtil, channel, Durations.fromSeconds(10));
     try {
       instanceMain(instance, type, args);
     } finally {

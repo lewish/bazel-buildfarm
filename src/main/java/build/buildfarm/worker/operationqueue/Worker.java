@@ -17,7 +17,6 @@ package build.buildfarm.worker.operationqueue;
 import static build.buildfarm.cas.CASFileCache.getInterruptiblyOrIOException;
 import static build.buildfarm.common.IOUtils.formatIOError;
 import static build.buildfarm.instance.Utils.getBlob;
-import static com.google.common.collect.Maps.uniqueIndex;
 import static com.google.common.util.concurrent.Futures.allAsList;
 import static com.google.common.util.concurrent.MoreExecutors.directExecutor;
 import static com.google.common.util.concurrent.MoreExecutors.listeningDecorator;
@@ -43,6 +42,7 @@ import build.buildfarm.common.DigestUtil;
 import build.buildfarm.common.DigestUtil.ActionKey;
 import build.buildfarm.common.DigestUtil.HashFunction;
 import build.buildfarm.common.InputStreamFactory;
+import build.buildfarm.common.LoggingMain;
 import build.buildfarm.common.Poller;
 import build.buildfarm.common.Write;
 import build.buildfarm.common.grpc.Retrier;
@@ -60,6 +60,7 @@ import build.buildfarm.v1test.QueueEntry;
 import build.buildfarm.v1test.QueuedOperation;
 import build.buildfarm.v1test.WorkerConfig;
 import build.buildfarm.worker.ExecuteActionStage;
+import build.buildfarm.worker.ExecutionPolicies;
 import build.buildfarm.worker.InputFetchStage;
 import build.buildfarm.worker.MatchStage;
 import build.buildfarm.worker.OutputDirectory;
@@ -74,6 +75,7 @@ import com.google.common.base.Strings;
 import com.google.common.base.Throwables;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Iterables;
+import com.google.common.collect.ListMultimap;
 import com.google.common.collect.Maps;
 import com.google.common.hash.HashCode;
 import com.google.common.util.concurrent.ListeningScheduledExecutorService;
@@ -83,6 +85,7 @@ import com.google.protobuf.ByteString;
 import com.google.protobuf.Duration;
 import com.google.protobuf.InvalidProtocolBufferException;
 import com.google.protobuf.TextFormat;
+import com.google.protobuf.util.Durations;
 import io.grpc.Channel;
 import io.grpc.Deadline;
 import io.grpc.ManagedChannel;
@@ -102,10 +105,11 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.logging.Level;
 import java.util.logging.Logger;
 import javax.naming.ConfigurationException;
 
-public class Worker {
+public class Worker extends LoggingMain {
   private static final Logger logger = Logger.getLogger(Worker.class.getName());
 
   private final Instance casInstance;
@@ -117,6 +121,7 @@ public class Worker {
   private final CASFileCache fileCache;
   private final Map<Path, Iterable<String>> rootInputFiles = new ConcurrentHashMap<>();
   private final Map<Path, Iterable<Digest>> rootInputDirectories = new ConcurrentHashMap<>();
+  private Pipeline pipeline;
 
   private static final ListeningScheduledExecutorService retryScheduler =
       listeningDecorator(newSingleThreadScheduledExecutor());
@@ -188,8 +193,7 @@ public class Worker {
         /* identifier=*/ "",
         digestUtil,
         channel,
-        deadlineAfterSeconds,
-        SECONDS,
+        Durations.fromSeconds(deadlineAfterSeconds),
         retrier,
         retryScheduler);
   }
@@ -199,6 +203,7 @@ public class Worker {
   }
 
   public Worker(WorkerConfig config, FileSystem fileSystem) throws ConfigurationException {
+    super("BuildFarmOperationQueueWorker");
     this.config = config;
 
     /* configuration validation */
@@ -378,7 +383,7 @@ public class Worker {
   public void start() throws InterruptedException {
     try {
       Files.createDirectories(root);
-      fileCache.start();
+      fileCache.start(false);
     } catch (IOException e) {
       logger.log(SEVERE, "error starting file cache", e);
       return;
@@ -390,8 +395,8 @@ public class Worker {
 
     WorkerContext context =
         new WorkerContext() {
-          Map<String, ExecutionPolicy> policies =
-              uniqueIndex(config.getExecutionPoliciesList(), (policy) -> policy.getName());
+          ListMultimap<String, ExecutionPolicy> policies =
+              ExecutionPolicies.toMultimap(config.getExecutionPoliciesList());
 
           @Override
           public String getName() {
@@ -562,7 +567,9 @@ public class Worker {
               throws IOException, InterruptedException {
             OutputDirectory outputDirectory =
                 OutputDirectory.parse(
-                    command.getOutputFilesList(), command.getOutputDirectoriesList());
+                    command.getOutputFilesList(),
+                    command.getOutputDirectoriesList(),
+                    command.getEnvironmentVariablesList());
 
             Path execDir = root.resolve(operationName);
             if (Files.exists(execDir)) {
@@ -606,7 +613,7 @@ public class Worker {
           }
 
           @Override
-          public void destroyExecDir(Path execDir) throws IOException {
+          public void destroyExecDir(Path execDir) throws IOException, InterruptedException {
             Iterable<String> inputFiles = rootInputFiles.remove(execDir);
             Iterable<Digest> inputDirectories = rootInputDirectories.remove(execDir);
 
@@ -615,7 +622,7 @@ public class Worker {
           }
 
           @Override
-          public ExecutionPolicy getExecutionPolicy(String name) {
+          public Iterable<ExecutionPolicy> getExecutionPolicies(String name) {
             return policies.get(name);
           }
 
@@ -696,7 +703,7 @@ public class Worker {
         new InputFetchStage(context, executeActionStage, new PutOperationStage(oq::requeue));
     PipelineStage matchStage = new MatchStage(context, inputFetchStage, errorStage);
 
-    Pipeline pipeline = new Pipeline();
+    pipeline = new Pipeline();
     // pipeline.add(errorStage, 0);
     pipeline.add(matchStage, 4);
     pipeline.add(inputFetchStage, 3);
@@ -707,9 +714,32 @@ public class Worker {
     if (Thread.interrupted()) {
       throw new InterruptedException();
     }
-    retryScheduler.shutdown();
+    stop();
+  }
+
+  @Override
+  protected void onShutdown() throws InterruptedException {
+    stop();
+  }
+
+  private void stop() throws InterruptedException {
+    boolean interrupted = Thread.interrupted();
+    if (pipeline != null) {
+      logger.log(Level.INFO, "Closing the pipeline");
+      try {
+        pipeline.close();
+      } catch (InterruptedException e) {
+        Thread.interrupted();
+        interrupted = true;
+      }
+      pipeline = null;
+    }
     if (!shutdownAndAwaitTermination(retryScheduler, 1, MINUTES)) {
       logger.severe("unable to terminate retry scheduler");
+    }
+    if (interrupted) {
+      Thread.currentThread().interrupt();
+      throw new InterruptedException();
     }
   }
 
@@ -762,6 +792,11 @@ public class Worker {
   }
 
   public static void main(String[] args) {
-    System.exit(workerMain(args) ? 0 : 1);
+    try {
+      System.exit(workerMain(args) ? 0 : 1);
+    } catch (Exception e) {
+      logger.log(SEVERE, "exception caught", e);
+      System.exit(1);
+    }
   }
 }

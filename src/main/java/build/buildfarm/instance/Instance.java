@@ -26,8 +26,10 @@ import build.bazel.remote.execution.v2.ResultsCachePolicy;
 import build.bazel.remote.execution.v2.ServerCapabilities;
 import build.buildfarm.common.DigestUtil;
 import build.buildfarm.common.DigestUtil.ActionKey;
+import build.buildfarm.common.EntryLimitException;
 import build.buildfarm.common.Watcher;
 import build.buildfarm.common.Write;
+import build.buildfarm.v1test.GetClientStartTimeResult;
 import build.buildfarm.v1test.OperationsStatus;
 import build.buildfarm.v1test.QueueEntry;
 import build.buildfarm.v1test.Tree;
@@ -43,7 +45,6 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.util.List;
 import java.util.UUID;
-import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 import javax.annotation.Nullable;
 
@@ -52,7 +53,7 @@ public interface Instance {
 
   DigestUtil getDigestUtil();
 
-  void start();
+  void start(String publicName);
 
   void stop() throws InterruptedException;
 
@@ -62,7 +63,7 @@ public interface Instance {
   void putActionResult(ActionKey actionKey, ActionResult actionResult) throws InterruptedException;
 
   ListenableFuture<Iterable<Digest>> findMissingBlobs(
-      Iterable<Digest> digests, Executor executor, RequestMetadata requestMetadata);
+      Iterable<Digest> digests, RequestMetadata requestMetadata);
 
   boolean containsBlob(Digest digest, RequestMetadata requestMetadata);
 
@@ -89,11 +90,10 @@ public interface Instance {
       throws IOException, InterruptedException;
 
   Write getBlobWrite(Digest digest, UUID uuid, RequestMetadata requestMetadata)
-      throws ExcessiveWriteSizeException;
+      throws EntryLimitException;
 
   Iterable<Digest> putAllBlobs(Iterable<ByteString> blobs, RequestMetadata requestMetadata)
-      throws ExcessiveWriteSizeException, IOException, IllegalArgumentException,
-          InterruptedException;
+      throws EntryLimitException, IOException, IllegalArgumentException, InterruptedException;
 
   Write getOperationStreamWrite(String name);
 
@@ -138,6 +138,8 @@ public interface Instance {
   ServerCapabilities getCapabilities();
 
   WorkerProfileMessage getWorkerProfile();
+
+  GetClientStartTimeResult getClientStartTime(String clientKey);
 
   interface MatchListener {
     // start/end pair called for each wait period
